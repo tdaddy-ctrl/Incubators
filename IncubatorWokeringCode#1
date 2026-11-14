@@ -1,0 +1,196 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// --- OLED Setup ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- Pin Definitions ---
+#define TMP36_PIN     A0
+#define RELAY_PIN     2
+#define ENCODER_CLK   3
+#define ENCODER_DT    4
+#define ENCODER_SW    5
+
+// --- Temperature Settings ---
+float targetTemp = 37.0;
+const float MIN_TEMP = 20.0;
+const float MAX_TEMP = 45.0;
+const float HYSTERESIS = 1.0;           // Wider dead band = no chatter
+const float TEMP_OFFSET = 0.0;
+
+// --- Relay Timing ---
+unsigned long lastRelayChange = 0;
+const unsigned long MIN_RELAY_INTERVAL = 5000;  // 5 seconds minimum between switches
+
+// --- Encoder Variables ---
+volatile int encoderPos = 0;
+int lastEncoderPos = 0;
+int lastCLKState;
+
+// --- Display Timing ---
+unsigned long lastDisplayUpdate = 0;
+const unsigned long DISPLAY_INTERVAL = 100;
+
+// --- Animation State ---
+uint8_t rippleRadius = 0;
+unsigned long lastRippleUpdate = 0;
+bool heaterState = false;
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  lastCLKState = digitalRead(ENCODER_CLK);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), readEncoder, CHANGE);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("OLED init failed");
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("DVC POND");
+  display.setCursor(0, 16);
+  display.println("Incubator Ready");
+  display.display();
+  delay(1500);
+  display.clearDisplay();
+}
+
+void loop() {
+  // --- Averaged TMP36 Reading (20 samples) ---
+  long total = 0;
+  for (int i = 0; i < 20; i++) {
+    total += analogRead(TMP36_PIN);
+    delay(2);
+  }
+  float sensorValue = total / 20.0;
+  float voltage = sensorValue * (5.0 / 1024.0);
+  float currentTemp = (voltage - 0.5) * 100.0 + TEMP_OFFSET;
+
+  // --- Handle Encoder ---
+  if (encoderPos != lastEncoderPos) {
+    int change = encoderPos - lastEncoderPos;
+    targetTemp += change * 0.5;
+    if (targetTemp < MIN_TEMP) targetTemp = MIN_TEMP;
+    if (targetTemp > MAX_TEMP) targetTemp = MAX_TEMP;
+    lastEncoderPos = encoderPos;
+  }
+
+  // --- Heater Control with Minimum Switch Interval ---
+  if (millis() - lastRelayChange >= MIN_RELAY_INTERVAL) {
+    if (currentTemp < targetTemp - HYSTERESIS && !heaterState) {
+      digitalWrite(RELAY_PIN, HIGH);
+      heaterState = true;
+      lastRelayChange = millis();
+    } else if (currentTemp >= targetTemp && heaterState) {
+      digitalWrite(RELAY_PIN, LOW);
+      heaterState = false;
+      lastRelayChange = millis();
+    }
+  }
+
+  // --- Ripple Animation ---
+  unsigned long rippleInterval = heaterState ? 80 : 250;
+  if (millis() - lastRippleUpdate >= rippleInterval) {
+    lastRippleUpdate = millis();
+    rippleRadius++;
+    if (rippleRadius > 7) rippleRadius = 1;
+  }
+
+  // --- Update OLED ---
+  if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+    lastDisplayUpdate = millis();
+    drawDisplay(currentTemp, targetTemp, heaterState);
+  }
+
+  delay(10);
+}
+
+// --- Draw the Display (Water Drop Logo) ---
+void drawDisplay(float currentTemp, float targetTemp, bool heaterOn) {
+  display.clearDisplay();
+
+  // --- Water Drop Logo (not a target) ---
+  // Drop outline: triangle top + circle bottom, hollowed out
+  display.fillTriangle(12, 1, 7, 10, 17, 10, SSD1306_WHITE);
+  display.fillCircle(12, 11, 5, SSD1306_WHITE);
+  display.fillTriangle(12, 4, 9, 9, 15, 9, SSD1306_BLACK);
+  display.fillCircle(12, 11, 2, SSD1306_BLACK);
+
+  // Animated ripple arc beneath the drop
+  if (rippleRadius > 0 && rippleRadius < 6) {
+    display.drawCircle(12, 13, rippleRadius + 2, SSD1306_WHITE);
+  }
+
+  // Glow ring when heater is on
+  if (heaterOn) {
+    display.drawCircle(12, 11, 8, SSD1306_WHITE);
+  }
+
+  // "DVC POND" text
+  display.setTextSize(1);
+  display.setCursor(26, 5);
+  display.print("DVC POND");
+
+  // Divider line
+  display.drawLine(0, 20, 128, 20, SSD1306_WHITE);
+
+  // --- Current Temperature ---
+  display.setTextSize(1);
+  display.setCursor(0, 24);
+  display.print("CURRENT");
+
+  display.setTextSize(3);
+  display.setCursor(0, 33);
+  display.print(currentTemp, 1);
+  display.setTextSize(1);
+  display.print(" C");
+
+  // --- Target Temperature ---
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  display.print("TARGET ");
+  display.print(targetTemp, 1);
+  display.print(" C");
+
+  // --- Heater Status ---
+  if (heaterOn) {
+    display.fillRect(90, 54, 38, 10, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(94, 55);
+    display.print("HEAT");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.drawRect(90, 54, 38, 10, SSD1306_WHITE);
+    display.setCursor(94, 55);
+    display.print("IDLE");
+  }
+
+  display.display();
+}
+
+// --- Encoder ISR ---
+void readEncoder() {
+  int currentCLKState = digitalRead(ENCODER_CLK);
+  if (currentCLKState != lastCLKState) {
+    if (digitalRead(ENCODER_DT) != currentCLKState) {
+      encoderPos++;
+    } else {
+      encoderPos--;
+    }
+  }
+  lastCLKState = currentCLKState;
+}
